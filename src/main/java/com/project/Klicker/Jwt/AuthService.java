@@ -24,9 +24,9 @@ public class AuthService {
         }
 
         Player newPlayer = new Player();
-        newPlayer.setUsername(registerRequest.getPassword());
+        newPlayer.setUsername(registerRequest.getUsername());
         newPlayer.setEmail(registerRequest.getEmail());
-        newPlayer.setPassword(registerRequest.getPassword());
+        newPlayer.setPassword(passwordEncoder.encode(registerRequest.getPassword()));
 
         playerRepository.save(newPlayer);
 
