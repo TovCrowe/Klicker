@@ -1,6 +1,6 @@
-# Klicker - Spring Boot JWT Authentication
+# Klicker - Spring Boot JWT Authentication + Matchmaking
 
-A Spring Boot REST API that handles player registration and login using JWT (JSON Web Tokens) for stateless authentication.
+A Spring Boot REST API that handles player registration, login with JWT, and matchmaking between players.
 
 ---
 
@@ -9,7 +9,8 @@ A Spring Boot REST API that handles player registration and login using JWT (JSO
 - Players can **register** with a username, email, and password
 - Players can **login** and receive a JWT token
 - Protected endpoints require the JWT token in the request header
-- Player data (username, email, password, wins, losses) is stored in a database via JPA
+- Players can **join a matchmaking queue** — when two players are waiting, a match is created
+- Player data and match data are stored in a database via JPA
 
 ---
 
@@ -21,23 +22,32 @@ src/main/java/com/project/Klicker/
 ├── KlickerApplication.java          # Entry point
 │
 ├── Entities/
-│   └── Player.java                  # Database model
+│   ├── Player.java                  # Database model for players
+│   └── Match.java                   # Database model for matches
 │
 ├── Repository/
-│   └── PlayerRepository.java        # Database access
+│   ├── PlayerRepository.java        # Database access for players
+│   └── MatchRepository.java         # Database access for matches
 │
 ├── DTO/
 │   ├── RegisterRequest.java         # Request body for /register
 │   ├── LoginRequest.java            # Request body for /login
 │   └── AuthResponse.java            # Response containing the JWT token
 │
+├── enums/
+│   └── MatchStatus.java             # Enum: WAITING, IN_PROGRESS, FINISHED
+│
 ├── Controllers/
-│   └── AuthController.java          # HTTP endpoints
+│   ├── AuthController.java          # HTTP endpoints for auth
+│   └── MatchController.java         # HTTP endpoints for matchmaking
 │
 ├── Jwt/
 │   ├── AuthService.java             # Register/login business logic
 │   ├── JwtService.java              # JWT creation and validation
 │   └── JwtFilter.java               # Intercepts requests to check JWT
+│
+├── service/
+│   └── MatchmakingService.java      # Matchmaking queue logic
 │
 └── Security/
     ├── PlayerUserDetailsService.java # Loads user from DB for Spring Security
@@ -60,11 +70,32 @@ Marks a class as a JPA database entity. Spring will map it to a table automatica
 public class Player { ... }
 ```
 
+### `@ManyToOne`
+Defines a many-to-one relationship between two entities. In `Match.java`, both `player1` and `player2` are `Player` entities. Many matches can involve the same player.
+
+```java
+@ManyToOne
+private Player player1;
+
+@ManyToOne
+private Player player2;
+```
+JPA uses this to generate a foreign key in the `matches` table pointing to the `players` table.
+
+### `@Enumerated(EnumType.STRING)`
+Tells JPA to store the enum as a string in the database (e.g. `"IN_PROGRESS"`) instead of an integer index. Always prefer `STRING` — if you add values to the enum, integer indexes shift and corrupt old data.
+
+```java
+@Enumerated(EnumType.STRING)
+private MatchStatus status = MatchStatus.WAITING;
+```
+
 ### `@Repository` (via `JpaRepository`)
-Extending `JpaRepository<Player, Long>` gives you free CRUD methods (`save`, `findById`, `findAll`, etc.) without writing SQL. You can also declare custom methods by name:
+Extending `JpaRepository<Entity, ID>` gives you free CRUD methods (`save`, `findById`, `findAll`, etc.) without writing SQL. You can also declare custom methods by name:
 
 ```java
 Optional<Player> findPlayerByUsername(String username);
+List<Match> findAllByStatus(MatchStatus status);
 // Spring reads the method name and builds the query for you
 ```
 
@@ -76,16 +107,17 @@ Marks a class as a REST controller. Every method returns JSON by default (no nee
 
 ```java
 @RestController
-@RequestMapping("/api/auth")
-public class AuthController { ... }
+@RequestMapping("/api/match")
+public class MatchController { ... }
 ```
 
-### `@PostMapping` + `@RequestBody`
-Maps a method to an HTTP POST request. `@RequestBody` deserializes the JSON body into a Java object.
+### `@PostMapping` + `@GetMapping` + `@PathVariable`
+Maps methods to HTTP verbs. `@PathVariable` extracts a value from the URL path.
 
 ```java
-@PostMapping("/login")
-public AuthResponse login(@RequestBody LoginRequest request) { ... }
+@GetMapping("/{matchId}")
+public ResponseEntity<MatchStatus> getMatchStatus(@PathVariable Long matchId) { ... }
+// GET /api/match/42  →  matchId = 42
 ```
 
 ### `@Configuration` + `@Bean`
@@ -103,10 +135,10 @@ Lombok generates a constructor for all `final` fields. Spring uses this construc
 
 ```java
 @RequiredArgsConstructor
-public class AuthService {
-    private final PlayerRepository playerRepository; // injected via constructor
-    private final PasswordEncoder passwordEncoder;
-    private final JwtService jwtService;
+public class MatchmakingService {
+    private final Queue<Long> waitingPlayers = new ConcurrentLinkedDeque<>();
+    private final MatchRepository matchRepository;
+    private final PlayerRepository playerRepository;
 }
 ```
 
@@ -116,6 +148,15 @@ Injects values from `application.properties` into a field.
 ```java
 @Value("${jwt.secret}")
 private String secret;
+```
+
+### `@Data` + `@NoArgsConstructor` (Lombok)
+`@Data` generates getters, setters, `equals`, `hashCode`, and `toString`. `@NoArgsConstructor` generates a no-arg constructor — JPA requires this to instantiate entities when loading from the database.
+
+```java
+@Data
+@NoArgsConstructor
+public class Match { ... }
 ```
 
 ---
@@ -161,6 +202,89 @@ Client sends: GET /api/whatever
 ```
 
 If no token or invalid token → request is rejected with 403.
+
+---
+
+## How Matchmaking Works
+
+### Joining the queue (`POST /api/match/join`)
+
+This endpoint is **protected** — you must send a JWT token. The controller reads your identity from Spring Security instead of asking the client to send their own ID (which would be unsafe).
+
+```
+Client sends: POST /api/match/join
+              Authorization: Bearer eyJ...
+
+→ MatchController.joinMatch()
+    → SecurityContextHolder.getContext().getAuthentication().getName()
+        → extracts the username from the JWT (set by JwtFilter earlier)
+    → PlayerRepository.findPlayerByUsername(username)
+        → loads the full Player from DB
+    → MatchmakingService.joinQueue(player.getId())
+        → if player is already in queue → throw exception
+        → add player to waitingPlayers queue
+        → if queue has 2+ players:
+            → poll player1 and player2 from queue
+            → create Match with status IN_PROGRESS
+            → save to DB
+            → return the Match
+        → if queue has < 2 players → return null
+
+← 202 Accepted  (still waiting for an opponent)
+   OR
+← 200 OK + Match object (match was created)
+```
+
+### The Matchmaking Queue
+
+`MatchmakingService` holds an in-memory queue using `ConcurrentLinkedDeque`. This is thread-safe, which matters because multiple HTTP requests can arrive at the same time.
+
+```java
+private final Queue<Long> waitingPlayers = new ConcurrentLinkedDeque<>();
+```
+
+**Important:** this queue lives in memory. If the server restarts, all waiting players are lost. A production app would use a database or Redis for the queue instead.
+
+### Checking match status (`GET /api/match/{matchId}`)
+
+```
+Client sends: GET /api/match/42
+              Authorization: Bearer eyJ...
+
+→ MatchController.getMatchStatus(42)
+→ MatchmakingService.getMatchStatus(42)
+    → MatchRepository.findById(42)
+    → return match.getStatus()
+← MatchStatus enum value (e.g. "IN_PROGRESS")
+```
+
+---
+
+## MatchStatus Enum
+
+```java
+public enum MatchStatus {
+    WAITING,      // match created but not yet started (not currently used by the queue flow)
+    IN_PROGRESS,  // both players matched, game is live
+    FINISHED      // game over
+}
+```
+
+Enums are a great way to represent a fixed set of states. Spring + JPA handle the conversion to/from the database string automatically via `@Enumerated(EnumType.STRING)`.
+
+---
+
+## SecurityContextHolder
+
+`SecurityContextHolder` is where Spring Security stores the currently authenticated user for the duration of a request. After `JwtFilter` validates the token and sets the authentication, any code in that request can read it:
+
+```java
+String username = SecurityContextHolder.getContext()
+        .getAuthentication()
+        .getName(); // returns the username from the JWT
+```
+
+This is how `MatchController` knows who is making the request without the client sending their own ID.
 
 ---
 
@@ -249,4 +373,10 @@ AuthController
         ├── PlayerRepository  (managed by Spring Data JPA)
         ├── PasswordEncoder   (bean from SecurityConfig)
         └── JwtService        (managed by Spring)
+
+MatchController
+  ├── MatchmakingService
+  │     ├── MatchRepository   (managed by Spring Data JPA)
+  │     └── PlayerRepository  (managed by Spring Data JPA)
+  └── PlayerRepository
 ```
